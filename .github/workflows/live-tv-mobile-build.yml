@@ -1,0 +1,406 @@
+name: Build Nuvio Live TV Mobile
+
+# Builds the phone and tablet apps from the official Nuvio Mobile source plus the Live TV patch
+# in .github/livetv/android-live-tv.patch:
+#   - Android APKs (signed with the Live TV key)
+#   - iPhone/iPad: an unsigned IPA, plus a signed build uploaded to TestFlight once the Apple secrets exist
+# Runs by hand, and once a month so the TestFlight build never expires (builds last 90 days).
+# A monthly run only refreshes TestFlight; it doesn't create a GitHub release.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 1 * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-tv-mobile-build
+  cancel-in-progress: false
+
+env:
+  # The exact Nuvio Mobile source the Live TV patch was made for.
+  NUVIO_MOBILE_COMMIT: 324afcffb962f1f7df45c5fa951131acec5a15a7
+  # Nuvio's public account server. These MUST stay defined: they are written into local.properties
+  # as NUVIO_SUPABASE_URL / NUVIO_SUPABASE_ANON_KEY, and empty values break sign-in.
+  NUVIO_API_URL: https://api.nuvio.tv
+  NUVIO_API_KEY: sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN
+  FALLBACK_GRADLE: "9.8.0"
+
+jobs:
+  android:
+    name: Android APKs
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    env:
+      KEYSTORE_BASE64: ${{ secrets.LIVE_TV_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.LIVE_TV_KEYSTORE_PASSWORD }}
+    steps:
+      # Leave persist-credentials at its default: Nuvio's repositories list sub-projects
+      # (such as libass-android) without addresses, so git's clean-up warns harmlessly.
+      - name: Get the Live TV patch from this repository
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          path: fork
+          sparse-checkout: |
+            .github/livetv
+          sparse-checkout-cone-mode: false
+
+      - name: Get the official Nuvio Mobile source
+        uses: actions/checkout@v6
+        with:
+          repository: NuvioMedia/NuvioMobile
+          ref: ${{ env.NUVIO_MOBILE_COMMIT }}
+          path: mobile
+
+      - name: Add Live TV
+        working-directory: mobile
+        run: |
+          patch_file="${GITHUB_WORKSPACE}/fork/.github/livetv/android-live-tv.patch"
+          if [[ ! -f "${patch_file}" ]]; then
+            echo "::error::.github/livetv/android-live-tv.patch was not found on dev."
+            exit 1
+          fi
+          git apply --whitespace=nowarn "${patch_file}" || git apply --ignore-whitespace --whitespace=nowarn "${patch_file}"
+          echo "Live TV added: $(git status --short | wc -l) files changed."
+
+      - name: Look up the latest Gradle version
+        id: gradle
+        run: |
+          latest="$(curl -fsSL https://services.gradle.org/versions/current | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+          if [[ -z "${latest}" ]]; then
+            echo "::warning::Could not look up the latest Gradle version; using the pinned ${FALLBACK_GRADLE}."
+            latest="${FALLBACK_GRADLE}"
+          fi
+          echo "version=${latest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Use the latest Gradle
+        working-directory: mobile
+        run: |
+          sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${{ steps.gradle.outputs.version }}-\1.zip#" gradle/wrapper/gradle-wrapper.properties
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Prepare sign-in settings and signing key
+        working-directory: mobile
+        run: |
+          if [[ -z "${NUVIO_API_URL}" || -z "${NUVIO_API_KEY}" ]]; then
+            echo "::error::NUVIO_API_URL / NUVIO_API_KEY are empty. Refusing to build."
+            exit 1
+          fi
+          keystore="${RUNNER_TEMP}/live-tv.jks"
+          if [[ -n "${KEYSTORE_BASE64}" && -n "${KEYSTORE_PASSWORD}" ]]; then
+            printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore}"
+            password="${KEYSTORE_PASSWORD}"
+          else
+            echo "::warning::No LIVE_TV_KEYSTORE secrets set; using a one-off key. Installing a later build will require uninstalling this one first."
+            password="live-tv-$(date +%s)"
+            keytool -genkeypair -noprompt -keystore "${keystore}" -storepass "${password}" -keypass "${password}" \
+              -alias livetv -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Nuvio Live TV"
+          fi
+          {
+            echo "NUVIO_SUPABASE_URL=${NUVIO_API_URL}"
+            echo "NUVIO_SUPABASE_ANON_KEY=${NUVIO_API_KEY}"
+            echo "NUVIO_RELEASE_STORE_FILE=${keystore}"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=${password}"
+            echo "NUVIO_RELEASE_KEY_ALIAS=livetv"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=${password}"
+          } > local.properties
+
+      - name: Build APKs
+        working-directory: mobile
+        run: |
+          args=(:androidApp:assembleFullRelease -Pnuvio.android.distribution=full -Pnuvio.android.applicationId=com.nuvio.app.livetv --stacktrace)
+          if ./gradlew "${args[@]}"; then
+            exit 0
+          fi
+          echo "::warning::The build failed with Gradle ${{ steps.gradle.outputs.version }}; trying again with the pinned Gradle ${FALLBACK_GRADLE}."
+          ./gradlew --stop || true
+          pkill -f KotlinCompileDaemon || true
+          sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${FALLBACK_GRADLE}-\1.zip#" gradle/wrapper/gradle-wrapper.properties
+          ./gradlew "${args[@]}"
+
+      - name: Rename APKs
+        run: |
+          mkdir -p out
+          for apk in mobile/androidApp/build/outputs/apk/full/release/*.apk; do
+            name="$(basename "${apk}")"
+            case "${name}" in
+              *arm64-v8a*)   cp "${apk}" out/Nuvio-LiveTV-Android-phone.apk ;;
+              *armeabi-v7a*) cp "${apk}" out/Nuvio-LiveTV-Android-older-32bit.apk ;;
+              *x86_64*)      cp "${apk}" out/Nuvio-LiveTV-Android-x86_64.apk ;;
+              *x86*)         cp "${apk}" out/Nuvio-LiveTV-Android-x86.apk ;;
+              *)             cp "${apk}" "out/${name}" ;;
+            esac
+          done
+          ls -la out
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: out/*.apk
+          if-no-files-found: error
+
+  ios-unsigned:
+    name: iOS unsigned IPA
+    if: github.event_name != 'schedule'
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: Release
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+    steps:
+      - name: Get the Live TV patch from this repository
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          path: fork
+          sparse-checkout: |
+            .github/livetv
+          sparse-checkout-cone-mode: false
+
+      - name: Get the official Nuvio Mobile source
+        uses: actions/checkout@v6
+        with:
+          repository: NuvioMedia/NuvioMobile
+          ref: ${{ env.NUVIO_MOBILE_COMMIT }}
+          path: mobile
+
+      - name: Add Live TV
+        working-directory: mobile
+        run: |
+          patch_file="${GITHUB_WORKSPACE}/fork/.github/livetv/android-live-tv.patch"
+          git apply --whitespace=nowarn "${patch_file}" || git apply --ignore-whitespace --whitespace=nowarn "${patch_file}"
+          echo "Live TV added: $(git status --short | wc -l) files changed."
+
+      - name: Set the iOS app name and IDs
+        working-directory: mobile
+        run: bash "${GITHUB_WORKSPACE}/fork/.github/livetv/ios-identity.sh" "" "$((1000 + GITHUB_RUN_NUMBER))"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('mobile/gradle/libs.versions.toml') }}
+
+      - name: Check the toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Prepare sign-in settings
+        working-directory: mobile
+        run: |
+          if [[ -z "${NUVIO_API_URL}" || -z "${NUVIO_API_KEY}" ]]; then
+            echo "::error::NUVIO_API_URL / NUVIO_API_KEY are empty. Refusing to build."
+            exit 1
+          fi
+          {
+            echo "NUVIO_SUPABASE_URL=${NUVIO_API_URL}"
+            echo "NUVIO_SUPABASE_ANON_KEY=${NUVIO_API_KEY}"
+          } > local.properties
+
+      - name: Fetch iOS dependencies
+        working-directory: mobile
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build the IPA
+        working-directory: mobile
+        run: ./scripts/build-ios-ipa.sh
+
+      - name: Name the IPA
+        run: |
+          mkdir -p out
+          ipa="$(ls mobile/build/ios-ipa/*.ipa | head -n 1)"
+          cp "${ipa}" out/Nuvio-LiveTV-iOS.ipa
+          ls -la out
+          echo "### Unsigned iOS IPA built: $(basename "${ipa}")" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios
+          path: out/Nuvio-LiveTV-iOS.ipa
+          if-no-files-found: error
+
+  apple-check:
+    name: Apple secrets present?
+    runs-on: ubuntu-24.04
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+    steps:
+      - id: check
+        run: |
+          if [[ -n "${APPLE_TEAM_ID}" && -n "${ASC_KEY_ID}" && -n "${ASC_ISSUER_ID}" && -n "${ASC_PRIVATE_KEY}" ]]; then
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+            echo "### TestFlight: Apple secrets found, signed build will run." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "### TestFlight skipped: Apple secrets missing (APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_PRIVATE_KEY)." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  ios-testflight:
+    name: iOS signed build to TestFlight
+    needs: apple-check
+    if: needs.apple-check.outputs.ready == 'true'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      NUVIO_IOS_DISTRIBUTION: full
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+    steps:
+      - name: Get the Live TV patch from this repository
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          path: fork
+          sparse-checkout: |
+            .github/livetv
+          sparse-checkout-cone-mode: false
+
+      - name: Get the official Nuvio Mobile source
+        uses: actions/checkout@v6
+        with:
+          repository: NuvioMedia/NuvioMobile
+          ref: ${{ env.NUVIO_MOBILE_COMMIT }}
+          path: mobile
+
+      - name: Add Live TV
+        working-directory: mobile
+        run: |
+          patch_file="${GITHUB_WORKSPACE}/fork/.github/livetv/android-live-tv.patch"
+          git apply --whitespace=nowarn "${patch_file}" || git apply --ignore-whitespace --whitespace=nowarn "${patch_file}"
+
+      - name: Set the iOS app name, IDs, team and build number
+        working-directory: mobile
+        run: bash "${GITHUB_WORKSPACE}/fork/.github/livetv/ios-identity.sh" "${APPLE_TEAM_ID}" "$((1000 + GITHUB_RUN_NUMBER))"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('mobile/gradle/libs.versions.toml') }}
+
+      - name: Prepare sign-in settings
+        working-directory: mobile
+        run: |
+          {
+            echo "NUVIO_SUPABASE_URL=${NUVIO_API_URL}"
+            echo "NUVIO_SUPABASE_ANON_KEY=${NUVIO_API_KEY}"
+          } > local.properties
+
+      - name: Fetch iOS dependencies
+        working-directory: mobile
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Write the App Store Connect key
+        run: |
+          mkdir -p "${RUNNER_TEMP}/asc"
+          printf '%s' "${ASC_PRIVATE_KEY}" > "${RUNNER_TEMP}/asc/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "${RUNNER_TEMP}/asc/AuthKey_${ASC_KEY_ID}.p8"
+          cat > "${RUNNER_TEMP}/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          EOF
+
+      - name: Archive (cloud-managed signing)
+        working-directory: mobile
+        run: |
+          xcodebuild -project iosApp/iosApp.xcodeproj -scheme iosApp -configuration Release \
+            -destination generic/platform=iOS -archivePath "${RUNNER_TEMP}/Nuvio.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "${RUNNER_TEMP}/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "${ASC_KEY_ID}" -authenticationKeyIssuerID "${ASC_ISSUER_ID}" \
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" CODE_SIGN_STYLE=Automatic \
+            archive
+
+      - name: Export and upload to TestFlight
+        working-directory: mobile
+        run: |
+          xcodebuild -exportArchive -archivePath "${RUNNER_TEMP}/Nuvio.xcarchive" \
+            -exportOptionsPlist "${RUNNER_TEMP}/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "${RUNNER_TEMP}/asc/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "${ASC_KEY_ID}" -authenticationKeyIssuerID "${ASC_ISSUER_ID}"
+          echo "### Uploaded build $((1000 + GITHUB_RUN_NUMBER)) to TestFlight" >> "${GITHUB_STEP_SUMMARY}"
+
+  publish:
+    name: Publish release
+    needs: [android, ios-unsigned]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && (needs.android.result == 'success' || needs.ios-unsigned.result == 'success') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the release notes
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          sparse-checkout: |
+            .github/livetv/release-notes.md
+          sparse-checkout-cone-mode: false
+
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="mobile-build-${GITHUB_RUN_NUMBER}"
+          gh release create "${tag}" dist/* --title "Nuvio Live TV Mobile — build ${GITHUB_RUN_NUMBER}" --notes-file .github/livetv/release-notes.md --target "${GITHUB_SHA}" --latest
