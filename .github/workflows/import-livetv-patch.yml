@@ -3,9 +3,6 @@ name: Import Live TV patch
 # One-off helper: copies the cumulative android-live-tv.patch from NuvioDesktop into this repository
 # (the file is too big to upload by hand), checks that it applies to Nuvio Mobile at the pinned commit,
 # and commits it to dev.
-#
-# TEMPORARY: the "push" trigger below lets this run from dev before the workflow exists on main
-# (GitHub only allows manual runs of workflows that are on main). Remove it once this is merged.
 
 on:
   workflow_dispatch:
@@ -13,10 +10,6 @@ on:
       source_commit:
         description: NuvioDesktop commit to copy the patch from
         default: e25886bb1fbbf1e6da5c27a241535c63a34a0e4b
-  push:
-    branches: [dev]
-    paths:
-      - .github/livetv/run-import.txt
 
 permissions:
   contents: write
