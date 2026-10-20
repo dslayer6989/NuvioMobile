@@ -176,7 +176,8 @@ jobs:
           parent="${GITHUB_RUN_ID}"
 
           start_child() {
-            local runner="$1" title="iOS build for run ${parent} on ${runner}"
+            local runner="$1"
+            local title="iOS build for run ${parent} on ${runner}"
             gh workflow run live-tv-ios-build.yml --ref main -f runner="${runner}" -f build_number="${build_number}" -f parent_run="${parent}" >&2
             local id=""
             for _ in $(seq 1 30); do
