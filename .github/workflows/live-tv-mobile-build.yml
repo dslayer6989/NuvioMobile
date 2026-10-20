@@ -6,9 +6,16 @@ name: Build Nuvio Live TV Mobile
 #   - iPhone/iPad: an unsigned IPA, plus a signed build uploaded to TestFlight once the Apple secrets exist
 # Runs by hand, and once a month so the TestFlight build never expires (builds last 90 days).
 # A monthly run only refreshes TestFlight; it doesn't create a GitHub release.
+#
+# TEMPORARY: the "push" trigger lets this start from dev before the workflow exists on main
+# (GitHub only allows manual runs of workflows that are on main). Remove it once this is merged.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - .github/livetv/run-build.txt
   schedule:
     - cron: "0 9 1 * *"
 
