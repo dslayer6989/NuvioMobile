@@ -1,0 +1,62 @@
+name: Import Live TV patch
+
+# One-off helper: copies the cumulative android-live-tv.patch from NuvioDesktop into this repository
+# (the file is too big to upload by hand), checks that it applies to Nuvio Mobile at the pinned commit,
+# and commits it to dev.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: NuvioDesktop commit to copy the patch from
+        default: e25886bb1fbbf1e6da5c27a241535c63a34a0e4b
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  NUVIO_MOBILE_COMMIT: 324afcffb962f1f7df45c5fa951131acec5a15a7
+  SOURCE_COMMIT: ${{ inputs.source_commit || 'e25886bb1fbbf1e6da5c27a241535c63a34a0e4b' }}
+
+jobs:
+  import:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+
+      - name: Download the patch
+        run: |
+          mkdir -p .github/livetv
+          curl -fsSL "https://raw.githubusercontent.com/dslayer6989/NuvioDesktop/${SOURCE_COMMIT}/android-live-tv.patch" -o .github/livetv/android-live-tv.patch
+          ls -l .github/livetv/android-live-tv.patch
+          sha256sum .github/livetv/android-live-tv.patch
+
+      - name: Check it applies to Nuvio Mobile at the pinned commit
+        run: |
+          git clone --no-checkout https://github.com/NuvioMedia/NuvioMobile.git /tmp/mobile
+          git -C /tmp/mobile checkout "${NUVIO_MOBILE_COMMIT}"
+          git -C /tmp/mobile apply --check --whitespace=nowarn "${GITHUB_WORKSPACE}/.github/livetv/android-live-tv.patch" \
+            || git -C /tmp/mobile apply --check --ignore-whitespace --whitespace=nowarn "${GITHUB_WORKSPACE}/.github/livetv/android-live-tv.patch"
+          echo "Patch applies cleanly."
+
+      - name: Commit to dev
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/livetv/android-live-tv.patch
+          if git diff --cached --quiet; then
+            echo "Patch already up to date."
+          else
+            git commit -m "feat(livetv): add cumulative Live TV patch from NuvioDesktop ${SOURCE_COMMIT} [skip ci]"
+            git pull --rebase origin dev
+            git push origin HEAD:dev
+          fi
+
+      - name: Start the mobile build
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run live-tv-mobile-build.yml --ref dev --repo "${GITHUB_REPOSITORY}"
