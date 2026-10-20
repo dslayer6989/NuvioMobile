@@ -1,2 +1,0 @@
-Changing this file on dev starts the "Import Live TV patch" workflow.
-Run 1
