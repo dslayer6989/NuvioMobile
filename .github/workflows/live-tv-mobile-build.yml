@@ -7,15 +7,11 @@ name: Build Nuvio Live TV Mobile
 # Runs by hand, and once a month so the TestFlight build never expires (builds last 90 days).
 # A monthly run only refreshes TestFlight; it doesn't create a GitHub release.
 #
-# TEMPORARY: the "push" trigger lets this start from dev before the workflow exists on main
-# (GitHub only allows manual runs of workflows that are on main). Remove it once this is merged.
+# The iOS build runs in live-tv-ios-build.yml: it tries macos-26 first and falls back to macos-15
+# if no Mac is free within 10 minutes. A release is only published when Android AND iOS both succeed.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [dev]
-    paths:
-      - .github/livetv/run-build.txt
   schedule:
     - cron: "0 9 1 * *"
 
@@ -159,99 +155,85 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
-  ios-unsigned:
+  ios:
     name: iOS unsigned IPA
     if: github.event_name != 'schedule'
-    runs-on: macos-26
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    permissions:
+      contents: read
+      actions: write
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      GRADLE_OPTS: -Dfile.encoding=UTF-8
-      IOS_CONFIGURATION: Release
-      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
-      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
-      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Get the Live TV patch from this repository
-        uses: actions/checkout@v6
-        with:
-          ref: dev
-          path: fork
-          sparse-checkout: |
-            .github/livetv
-          sparse-checkout-cone-mode: false
-
-      - name: Get the official Nuvio Mobile source
-        uses: actions/checkout@v6
-        with:
-          repository: NuvioMedia/NuvioMobile
-          ref: ${{ env.NUVIO_MOBILE_COMMIT }}
-          path: mobile
-
-      - name: Add Live TV
-        working-directory: mobile
+      # The real build lives in live-tv-ios-build.yml. This cheap Linux job starts it on macos-26 and,
+      # if no Mac picks it up within 10 minutes, cancels it and starts it again on macos-15.
+      - name: Build on macos-26, or on macos-15 if no Mac is free
         run: |
-          patch_file="${GITHUB_WORKSPACE}/fork/.github/livetv/android-live-tv.patch"
-          git apply --whitespace=nowarn "${patch_file}" || git apply --ignore-whitespace --whitespace=nowarn "${patch_file}"
-          echo "Live TV added: $(git status --short | wc -l) files changed."
+          set -u
+          build_number="${GITHUB_RUN_NUMBER}"
+          parent="${GITHUB_RUN_ID}"
 
-      - name: Set the iOS app name and IDs
-        working-directory: mobile
-        run: bash "${GITHUB_WORKSPACE}/fork/.github/livetv/ios-identity.sh" "" "$((1000 + GITHUB_RUN_NUMBER))"
+          start_child() {
+            local runner="$1" title="iOS build for run ${parent} on ${runner}"
+            gh workflow run live-tv-ios-build.yml --ref main -f runner="${runner}" -f build_number="${build_number}" -f parent_run="${parent}" >&2
+            local id=""
+            for _ in $(seq 1 30); do
+              sleep 5
+              id="$(gh run list --workflow live-tv-ios-build.yml --event workflow_dispatch --limit 20 --json databaseId,displayTitle --jq "[.[] | select(.displayTitle == \"${title}\")][0].databaseId // empty")"
+              [[ -n "${id}" ]] && break
+            done
+            [[ -n "${id}" ]] || { echo "::error::Could not find the iOS run that was just started." >&2; return 1; }
+            echo "${id}"
+          }
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 17
+          job_status() { gh api "repos/${GH_REPO}/actions/runs/$1/jobs" --jq '.jobs[0].status // "queued"'; }
+          run_state() { gh run view "$1" --json status,conclusion --jq '.status + " " + (.conclusion // "")'; }
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+          child="$(start_child macos-26)" || exit 1
+          echo "Started the macos-26 build: https://github.com/${GH_REPO}/actions/runs/${child}"
+          started=false
+          for _ in $(seq 1 30); do
+            sleep 20
+            st="$(job_status "${child}")"
+            state="$(run_state "${child}")"
+            echo "macos-26 job: ${st} (run: ${state})"
+            if [[ "${st}" == "in_progress" ]]; then started=true; break; fi
+            if [[ "${state}" == completed* ]]; then break; fi
+          done
 
-      - name: Cache Kotlin/Native
-        uses: actions/cache@v5
-        with:
-          path: ~/.konan
-          key: konan-${{ runner.os }}-${{ hashFiles('mobile/gradle/libs.versions.toml') }}
-
-      - name: Check the toolchain
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-
-      - name: Prepare sign-in settings
-        working-directory: mobile
-        run: |
-          if [[ -z "${NUVIO_API_URL}" || -z "${NUVIO_API_KEY}" ]]; then
-            echo "::error::NUVIO_API_URL / NUVIO_API_KEY are empty. Refusing to build."
-            exit 1
+          if [[ "${started}" != true ]] && [[ "$(run_state "${child}")" != completed\ success ]]; then
+            if [[ "$(run_state "${child}")" != completed* ]]; then
+              echo "No macos-26 Mac became free in 10 minutes. Cancelling it and using macos-15."
+              gh run cancel "${child}" || true
+              for _ in $(seq 1 30); do [[ "$(run_state "${child}")" == completed* ]] && break; sleep 10; done
+            fi
+            if [[ "$(run_state "${child}")" != completed\ success ]]; then
+              child="$(start_child macos-15)" || exit 1
+              echo "Started the macos-15 build: https://github.com/${GH_REPO}/actions/runs/${child}"
+            fi
           fi
-          {
-            echo "NUVIO_SUPABASE_URL=${NUVIO_API_URL}"
-            echo "NUVIO_SUPABASE_ANON_KEY=${NUVIO_API_KEY}"
-          } > local.properties
 
-      - name: Fetch iOS dependencies
-        working-directory: mobile
-        run: ./scripts/prepare-ios-dependencies.sh
-
-      - name: Build the IPA
-        working-directory: mobile
-        run: ./scripts/build-ios-ipa.sh
-
-      - name: Name the IPA
-        run: |
-          mkdir -p out
-          ipa="$(ls mobile/build/ios-ipa/*.ipa | head -n 1)"
-          cp "${ipa}" out/Nuvio-LiveTV-iOS.ipa
-          ls -la out
-          echo "### Unsigned iOS IPA built: $(basename "${ipa}")" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Waiting for run ${child} to finish."
+          while true; do
+            state="$(run_state "${child}")"
+            [[ "${state}" == completed* ]] && break
+            sleep 60
+          done
+          echo "Finished: ${state}"
+          echo "${child}" > child-run-id.txt
+          [[ "${state}" == "completed success" ]] || { echo "::error::The iOS build did not succeed (${state})."; exit 1; }
+          mkdir -p dist
+          gh run download "${child}" -n ios -D dist
+          ls -la dist
+          echo "### iOS IPA built in run ${child}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v7
         with:
           name: ios
-          path: out/Nuvio-LiveTV-iOS.ipa
+          path: dist/Nuvio-LiveTV-iOS.ipa
           if-no-files-found: error
 
   apple-check:
@@ -386,8 +368,9 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [android, ios-unsigned]
-    if: ${{ !cancelled() && github.event_name != 'schedule' && (needs.android.result == 'success' || needs.ios-unsigned.result == 'success') }}
+    needs: [android, ios]
+    # Only publish when both Android and iOS built, so a release is never half empty.
+    if: ${{ success() && github.event_name != 'schedule' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Get the release notes

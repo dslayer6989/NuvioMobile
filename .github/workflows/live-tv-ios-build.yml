@@ -1,0 +1,134 @@
+name: Build Nuvio Live TV iOS (one runner)
+
+# Started by live-tv-mobile-build.yml. Builds the unsigned iOS IPA on the Mac type it is told to use
+# (macos-26 first, macos-15 as the fallback). You normally don't run this by hand.
+
+run-name: iOS build for run ${{ inputs.parent_run }} on ${{ inputs.runner }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Mac runner type
+        required: true
+        default: macos-26
+        type: choice
+        options: [macos-26, macos-15]
+      build_number:
+        description: Build number of the main run
+        required: true
+        type: string
+      parent_run:
+        description: ID of the main run that started this one
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NUVIO_MOBILE_COMMIT: 324afcffb962f1f7df45c5fa951131acec5a15a7
+  NUVIO_API_URL: https://api.nuvio.tv
+  NUVIO_API_KEY: sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN
+
+jobs:
+  ios:
+    name: iOS unsigned IPA (${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    env:
+      BUILD_NUMBER: ${{ inputs.build_number }}
+      RUNNER_NAME_INPUT: ${{ inputs.runner }}
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: Release
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+    steps:
+      - name: Get the Live TV patch from this repository
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          path: fork
+          sparse-checkout: |
+            .github/livetv
+          sparse-checkout-cone-mode: false
+
+      - name: Get the official Nuvio Mobile source
+        uses: actions/checkout@v6
+        with:
+          repository: NuvioMedia/NuvioMobile
+          ref: ${{ env.NUVIO_MOBILE_COMMIT }}
+          path: mobile
+
+      - name: Add Live TV
+        working-directory: mobile
+        run: |
+          patch_file="${GITHUB_WORKSPACE}/fork/.github/livetv/android-live-tv.patch"
+          git apply --whitespace=nowarn "${patch_file}" || git apply --ignore-whitespace --whitespace=nowarn "${patch_file}"
+          echo "Live TV added: $(git status --short | wc -l) files changed."
+
+      - name: Set the iOS app name and IDs
+        working-directory: mobile
+        run: bash "${GITHUB_WORKSPACE}/fork/.github/livetv/ios-identity.sh" "" "$((1000 + BUILD_NUMBER))"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('mobile/gradle/libs.versions.toml') }}
+
+      - name: Pick the Xcode for this Mac
+        run: |
+          if [[ "${RUNNER_NAME_INPUT}" == "macos-26" ]]; then xcode=/Applications/Xcode_26.6.app; else xcode=/Applications/Xcode_26.3.app; fi
+          [[ -d "${xcode}" ]] || { echo "::error::${xcode} is not installed on this runner."; ls /Applications | grep -i xcode; exit 1; }
+          echo "DEVELOPER_DIR=${xcode}/Contents/Developer" >> "${GITHUB_ENV}"
+
+      - name: Check the toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Prepare sign-in settings
+        working-directory: mobile
+        run: |
+          if [[ -z "${NUVIO_API_URL}" || -z "${NUVIO_API_KEY}" ]]; then
+            echo "::error::NUVIO_API_URL / NUVIO_API_KEY are empty. Refusing to build."
+            exit 1
+          fi
+          {
+            echo "NUVIO_SUPABASE_URL=${NUVIO_API_URL}"
+            echo "NUVIO_SUPABASE_ANON_KEY=${NUVIO_API_KEY}"
+          } > local.properties
+
+      - name: Fetch iOS dependencies
+        working-directory: mobile
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build the IPA
+        working-directory: mobile
+        run: ./scripts/build-ios-ipa.sh
+
+      - name: Name the IPA
+        run: |
+          mkdir -p out
+          ipa="$(ls mobile/build/ios-ipa/*.ipa | head -n 1)"
+          cp "${ipa}" out/Nuvio-LiveTV-iOS.ipa
+          ls -la out
+          echo "### Unsigned iOS IPA built: $(basename "${ipa}")" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios
+          path: out/Nuvio-LiveTV-iOS.ipa
+          if-no-files-found: error
